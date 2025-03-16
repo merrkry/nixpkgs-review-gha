@@ -28,18 +28,13 @@ on:
         required: true
         type: boolean
         default: true
-      upstream-eval-timeout:
-        description: "How long to wait for upstream eval (in seconds)"
-        required: true
-        type: number
-        default: 900
       local-eval:
         description: "Force local eval"
         required: true
         type: boolean
         default: false
-      attic:
-        description: "Push to attic"
+      push-to-cache:
+        description: "Push to cache"
         required: true
         type: boolean
         default: true
@@ -53,6 +48,11 @@ on:
         required: true
         type: boolean
         default: true
+      approve-on-success:
+        description: "Approve PR on review success"
+        required: true
+        type: boolean
+        default: false
 
 jobs:
   review:
@@ -83,26 +83,41 @@ jobs:
       fetch_cmd_aarch64-linux: ${{ steps.report.outputs.fetch_cmd_aarch64-linux }}
       fetch_cmd_x86_64-darwin: ${{ steps.report.outputs.fetch_cmd_x86_64-darwin }}
       fetch_cmd_aarch64-darwin: ${{ steps.report.outputs.fetch_cmd_aarch64-darwin }}
+
     steps:
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@main
       - name: prepare /nix
         run: sudo mkdir /mnt/nix && sudo mount -m -o bind /mnt/nix /nix
         if: ${{ matrix.system == 'x86_64-linux' || matrix.system == 'aarch64-linux' }}
+
       - name: install nix
         uses: DeterminateSystems/nix-installer-action@v16
+
+      - name: install packages
+        run: |
+          pkgs=(coreutils nixpkgs-review jq)
+          if [[ ${{ inputs.push-to-cache && vars.ATTIC_SERVER != '' && vars.ATTIC_CACHE != '' }} = true ]]; then
+            pkgs+=(attic-client)
+          elif [[ ${{ inputs.push-to-cache && vars.CACHIX_CACHE != '' }} = true ]]; then
+            pkgs+=(cachix)
+          fi
+          args=()
+          for pkg in ${pkgs[@]}; do args+=("github:nixos/nixpkgs/nixos-unstable#$pkg"); done
+          nix profile install ${args[@]}
+
       - name: clone nixpkgs
         uses: actions/checkout@v4
         with:
           repository: NixOS/nixpkgs
+
       - name: wait for upstream eval
-        if: ${{ inputs.upstream-eval-timeout > 0 && !inputs.local-eval }}
+        if: ${{ !inputs.local-eval }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           start=$(date +%s)
-          timeout=${{ inputs.upstream-eval-timeout }}
-          timeout=${timeout%.*}
+          timeout=900
           while [[ $(( $(date +%s) - $start )) -lt $timeout ]]; do
             status=$(gh pr -R nixos/nixpkgs checks ${{ inputs.pr }} --json 'state,name,workflow' -q '.[]|select(.name=="Process" and (.workflow=="Eval" or .workflow==".github/workflows/eval.yml"))|.state')
             if [[ -z "$status" ]]; then echo "Failed to find eval check"
@@ -110,9 +125,10 @@ jobs:
             if [[ "$status" = "SUCCESS" ]]; then break; fi
             sleep 10
           done
+
       - name: run nixpkgs-review
         run: |
-          nix run github:nixos/nixpkgs/nixos-unstable#nixpkgs-review -- \
+          nixpkgs-review -- \
             pr ${{ inputs.pr }} \
             --eval ${{ inputs.local-eval && 'local' || 'auto' }} \
             --no-shell \
@@ -122,59 +138,77 @@ jobs:
             || true
         env:
           GITHUB_TOKEN: ${{ github.token }}
-      - name: push results to attic
-        if: ${{ inputs.attic && vars.ATTIC_SERVER != '' && vars.ATTIC_CACHE != '' }}
+
+      - name: push results to cache
+        if: ${{ inputs.push-to-cache && ((vars.ATTIC_SERVER != '' && vars.ATTIC_CACHE != '') || vars.CACHIX_CACHE != '') }}
         run: |
           set -ex
-          attic=$(nix build --no-link --print-out-paths github:nixos/nixpkgs/nixos-unstable#attic-client)/bin/attic
-          realpath=$(nix build --no-link --print-out-paths github:nixos/nixpkgs/nixos-unstable#coreutils)/bin/realpath
-          $attic login default "$ATTIC_SERVER" "$ATTIC_TOKEN"
-          $attic cache info "$ATTIC_CACHE"
-          ($realpath -qe ~/.cache/nixpkgs-review/pr-${{ inputs.pr }}/results/* || true) > paths
-          $attic push --stdin "$ATTIC_CACHE" < paths
-          info=$(curl -f -H "Authorization: Bearer ${ATTIC_TOKEN}" "${ATTIC_SERVER}_api/v1/cache-config/${ATTIC_CACHE}")
-          substituter_endpoint=$(jq -r .substituter_endpoint <<< "$info")
-          public_key=$(jq -r .public_key <<< "$info")
-          is_public=$(jq -r .is_public <<< "$info")
+
+          (realpath -qe ~/.cache/nixpkgs-review/pr-${{ inputs.pr }}/results/* || true) > paths
+          [[ -s paths ]] || exit 0
+
+          if [[ ${{ vars.ATTIC_SERVER != '' && vars.ATTIC_CACHE != '' }} = true ]]; then
+            attic login default "$ATTIC_SERVER" "$ATTIC_TOKEN"
+            attic cache info "$ATTIC_CACHE"
+            attic push --stdin "$ATTIC_CACHE" < paths
+            info=$(curl -f -H "Authorization: Bearer ${ATTIC_TOKEN}" "${ATTIC_SERVER}_api/v1/cache-config/${ATTIC_CACHE}")
+            substituter_endpoint=$(jq -r .substituter_endpoint <<< "$info")
+            public_key=$(jq -r .public_key <<< "$info")
+            is_public=$(jq -r .is_public <<< "$info")
+          elif [[ ${{ vars.CACHIX_CACHE != '' }} = true ]]; then
+            [[ -n "$CACHIX_SIGNING_KEY" ]] || unset CACHIX_SIGNING_KEY
+            cachix push "$CACHIX_CACHE" < paths
+            info=$(curl -f -H "Authorization: Bearer ${CACHIX_AUTH_TOKEN}" "https://app.cachix.org/api/v1/cache/${CACHIX_CACHE}")
+            substituter_endpoint=$(jq -r .uri <<< "$info")
+            public_key=$(jq -r '.publicSigningKeys[]' <<< "$info")
+            is_public=$(jq -r .isPublic <<< "$info")
+          fi
+
+          [[ "$is_public" = true ]] || exit 0
+
           echo "nix-store -r --add-root nixpkgs-pr-${{ inputs.pr }}-${{ matrix.system }} \\" >> fetch_cmd
           echo "  --option binary-caches 'https://cache.nixos.org/ $substituter_endpoint' \\" >> fetch_cmd
           echo "  --option trusted-public-keys '" >> fetch_cmd
           echo "  cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=" >> fetch_cmd
           echo "  $public_key" >> fetch_cmd
           echo -n "  '" >> fetch_cmd
-          ok=0
           for p in $(cat paths); do
             echo -e " \\" >> fetch_cmd
             echo -n "  $p" >> fetch_cmd
-            ok=1
           done
-          [[ "$is_public" = "true" ]] && [[ $ok = 1 ]] || rm fetch_cmd
         env:
           ATTIC_SERVER: ${{ vars.ATTIC_SERVER }}
           ATTIC_CACHE: ${{ vars.ATTIC_CACHE }}
           ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+          CACHIX_CACHE: ${{ vars.CACHIX_CACHE }}
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          CACHIX_SIGNING_KEY: ${{ secrets.CACHIX_SIGNING_KEY }}
+
       - name: start upterm session
         if: ${{ inputs.upterm }}
         uses: owenthereal/action-upterm@v1
         with:
           limit-access-to-actor: true
+
       - name: generate report
         id: report
         run: |
-          base64=$(nix build --no-link --print-out-paths github:nixos/nixpkgs/nixos-unstable#coreutils)/bin/base64
           if [[ -s fetch_cmd ]]; then
             cat fetch_cmd
-            echo fetch_cmd_${{ matrix.system }}=$($base64 -w0 fetch_cmd) >> "$GITHUB_OUTPUT"
+            echo fetch_cmd_${{ matrix.system }}=$(base64 -w0 fetch_cmd) >> "$GITHUB_OUTPUT"
           fi
-          report=~/.cache/nixpkgs-review/pr-${{ inputs.pr }}/report.md
-          cat $report
-          echo report_${{ matrix.system }}=$($base64 -w0 $report) >> "$GITHUB_OUTPUT"
+          dir=~/.cache/nixpkgs-review/pr-${{ inputs.pr }}
+          cat $dir/report.md
+          report=$(jq -c '.+{$md}' $dir/report.json --rawfile md $dir/report.md | base64 -w0)
+          echo report_${{ matrix.system }}=$report >> "$GITHUB_OUTPUT"
 
   report:
     runs-on: ubuntu-latest
     needs: [review]
     outputs:
       report: ${{ steps.report.outputs.report }}
+      success: ${{ steps.report.outputs.success }}
+
     steps:
       - name: generate report
         id: report
@@ -203,26 +237,45 @@ jobs:
             echo -e "</ul></details>\n" >> report.md
           fi
 
-          echo ${{ needs.review.outputs.report_x86_64-linux }} | base64 -d >> report.md
-          echo ${{ needs.review.outputs.report_aarch64-linux }} | base64 -d >> report.md
-          echo ${{ needs.review.outputs.report_x86_64-darwin }} | base64 -d >> report.md
-          echo ${{ needs.review.outputs.report_aarch64-darwin }} | base64 -d >> report.md
+          mkdir reports
+          echo ${{ needs.review.outputs.report_x86_64-linux }} | base64 -d > reports/x86_64-linux.json
+          echo ${{ needs.review.outputs.report_aarch64-linux }} | base64 -d > reports/aarch64-linux.json
+          echo ${{ needs.review.outputs.report_x86_64-darwin }} | base64 -d > reports/x86_64-darwin.json
+          echo ${{ needs.review.outputs.report_aarch64-darwin }} | base64 -d > reports/aarch64-darwin.json
+          for system in x86_64-linux aarch64-linux x86_64-darwin aarch64-darwin; do
+            if [[ -s reports/$system.json ]]; then
+              jq -r '.md' reports/$system.json >> report.md
+            fi
+          done
 
           cat report.md
           echo report=$(base64 -w0 report.md) >> "$GITHUB_OUTPUT"
+          echo success=$(jq -s 'all(.[].result[]; .failed==[])' reports/*.json) >> "$GITHUB_OUTPUT"
 
   post-result:
     runs-on: ubuntu-latest
     needs: [report]
-    if: ${{ inputs.post-result }}
+    if: ${{ inputs.post-result || inputs.approve-on-success }}
     environment: post-result
+
     steps:
       - name: fetch report
         run: echo ${{ needs.report.outputs.report }} | base64 -d > report.md
+
       - name: post comment
+        if: ${{ inputs.post-result }}
         run: |
           if [[ -n "$GH_TOKEN" ]]; then
             gh pr -R NixOS/nixpkgs comment ${{ inputs.pr }} -F report.md
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: approve pull request
+        if: ${{ inputs.approve-on-success && needs.report.outputs.success == 'true' }}
+        run: |
+          if [[ -n "$GH_TOKEN" ]]; then
+            gh pr -R NixOS/nixpkgs review ${{ inputs.pr }} --approve -b "Approved automatically following the successful run of \`nixpkgs-review\`." || true
           fi
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
